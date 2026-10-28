@@ -2542,7 +2542,15 @@ impl Node {
             // matching the on-chain nullifier PDAs that are the authoritative
             // double-spend gate (#624).
             if let Some(pool) = &self.shielded_pool {
-                pool.record_spent(approved.request.nullifiers).await;
+                if let Err(e) = pool
+                    .index_transact_settlement(
+                        approved.request.nullifiers,
+                        approved.request.output_commitments,
+                    )
+                    .await
+                {
+                    log::warn!("failed to index transact settlement in shielded pool: {e}");
+                }
             }
         }
 

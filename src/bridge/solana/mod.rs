@@ -2,7 +2,8 @@
 
 pub(crate) mod cosign_assembly;
 mod cosign_message;
-mod decoder;
+pub mod decoder;
+pub use decoder::{extract_bridge_events, extract_deposit_events, BridgeProgramEvent};
 mod instructions;
 mod keypair;
 mod listener;

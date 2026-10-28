@@ -212,3 +212,93 @@ impl BridgeRpc for MockBridgeRpc {
         take(&self.next_get_slot, "get_slot")
     }
 }
+
+/// Build a synthetic transact transaction (#920).
+pub fn synth_transact_tx(
+    signature: Signature,
+    slot: u64,
+    program_id: &Pubkey,
+    nullifiers: [[u8; 32]; 2],
+    output_commitments: [[u8; 32]; 2],
+) -> EncodedConfirmedTransactionWithStatusMeta {
+    use crate::bridge::solana::instructions::TransactInstructionData;
+    let payload = TransactInstructionData {
+        nullifiers,
+        output_commitments,
+        root: [0u8; 32],
+        ext_amount: 0,
+        proof: vec![1, 2, 3],
+    };
+    let mut data = discriminators::TRANSACT.to_vec();
+    data.extend_from_slice(&borsh::to_vec(&payload).expect("borsh serialise"));
+    let instruction = UiCompiledInstruction {
+        program_id_index: 1,
+        accounts: vec![0],
+        data: bs58::encode(data).into_string(),
+        stack_height: None,
+    };
+    let dummy = Pubkey::default();
+    let account_keys = vec![dummy.to_string(), program_id.to_string()];
+    let raw = UiRawMessage {
+        header: MessageHeader {
+            num_required_signatures: 1,
+            num_readonly_signed_accounts: 0,
+            num_readonly_unsigned_accounts: 1,
+        },
+        account_keys,
+        recent_blockhash: Hash::default().to_string(),
+        instructions: vec![instruction],
+        address_table_lookups: None,
+    };
+    EncodedConfirmedTransactionWithStatusMeta {
+        slot,
+        transaction: EncodedTransactionWithStatusMeta {
+            transaction: EncodedTransaction::Json(UiTransaction {
+                signatures: vec![signature.to_string()],
+                message: UiMessage::Raw(raw),
+            }),
+            meta: None,
+            version: None,
+        },
+        block_time: None,
+    }
+}
+
+/// Build a synthetic transaction touching the program with an unrecognized instruction (empty events) (#920).
+pub fn synth_empty_program_tx(
+    signature: Signature,
+    slot: u64,
+    program_id: &Pubkey,
+) -> EncodedConfirmedTransactionWithStatusMeta {
+    let instruction = UiCompiledInstruction {
+        program_id_index: 1,
+        accounts: vec![0],
+        data: bs58::encode([255u8; 8]).into_string(),
+        stack_height: None,
+    };
+    let dummy = Pubkey::default();
+    let account_keys = vec![dummy.to_string(), program_id.to_string()];
+    let raw = UiRawMessage {
+        header: MessageHeader {
+            num_required_signatures: 1,
+            num_readonly_signed_accounts: 0,
+            num_readonly_unsigned_accounts: 1,
+        },
+        account_keys,
+        recent_blockhash: Hash::default().to_string(),
+        instructions: vec![instruction],
+        address_table_lookups: None,
+    };
+    EncodedConfirmedTransactionWithStatusMeta {
+        slot,
+        transaction: EncodedTransactionWithStatusMeta {
+            transaction: EncodedTransaction::Json(UiTransaction {
+                signatures: vec![signature.to_string()],
+                message: UiMessage::Raw(raw),
+            }),
+            meta: None,
+            version: None,
+        },
+        block_time: None,
+    }
+}

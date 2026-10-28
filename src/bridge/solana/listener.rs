@@ -4,7 +4,9 @@
 //! transactions, decodes them via [`crate::bridge::solana::decoder`],
 //! and feeds the resulting events into the local privacy pool.
 
-use crate::bridge::solana::decoder::{extract_deposit_events, LISTENER_TX_ENCODING};
+use crate::bridge::solana::decoder::{
+    extract_bridge_events, BridgeProgramEvent, LISTENER_TX_ENCODING,
+};
 use crate::bridge::solana::rpc::BridgeRpc;
 use crate::bridge::{BridgeConfig, BridgeError, BridgeStats, DepositEvent, Result};
 use crate::privacy::poseidon_circom::v3_commit;
@@ -314,51 +316,91 @@ impl EventListener {
         (cursor, failed)
     }
 
-    /// Run a single poll cycle: fetch new signatures, decode any deposits,
-    /// process them into the pool. Returns the number of events processed.
+    /// Run a single poll cycle: fetch new signatures, decode any events,
+    /// process them into the pool. Returns the number of events processed (#920).
     async fn poll_events(state: &PollerState) -> Result<usize> {
         let cursor = *state.last_signature.read().await;
-        let events = Self::fetch_events(state, cursor).await?;
+        let batch = Self::fetch_scanned_batch(state, cursor).await?;
 
         let mut processed = 0;
         let mut latest_slot: u64 = 0;
-        // Per-signature outcome, in the ascending order deposits are processed,
+        // Per-signature outcome, in ascending chronological order,
         // so the cursor can advance only through the unbroken run of successes.
         let mut outcomes: Vec<(Signature, bool)> = Vec::new();
 
-        for event in events {
-            let amount = event.amount;
-            let slot = event.block;
-            let sig_str = event.signature.clone();
-            let parsed = sig_str.parse::<Signature>().ok();
+        for (sig, sig_events) in batch {
+            if sig_events.is_empty() {
+                // Finalized signature carrying no new events (non-deposit instruction,
+                // chain-reverted transaction, or already-seen signature): marks success
+                // so contiguous_cursor advances through it (#920).
+                outcomes.push((sig, true));
+                continue;
+            }
 
-            match Self::process_deposit(&state.pool, event).await {
-                Ok(_) => {
-                    processed += 1;
-                    let mut stats_guard = state.stats.write().await;
-                    stats_guard.total_deposits += 1;
-                    stats_guard.volume_deposited += amount;
-                    drop(stats_guard);
+            let mut sig_success = true;
+            for event in sig_events {
+                match event {
+                    BridgeProgramEvent::Deposit(deposit) => {
+                        let amount = deposit.amount;
+                        let slot = deposit.block;
+                        let sig_str = deposit.signature.clone();
 
-                    if slot > latest_slot {
-                        latest_slot = slot;
+                        match Self::process_deposit(&state.pool, deposit).await {
+                            Ok(_) => {
+                                processed += 1;
+                                let mut stats_guard = state.stats.write().await;
+                                stats_guard.total_deposits += 1;
+                                stats_guard.volume_deposited += amount;
+                                drop(stats_guard);
+
+                                if slot > latest_slot {
+                                    latest_slot = slot;
+                                }
+                            }
+                            Err(e) => {
+                                log::error!(
+                                    target: "paraloom::bridge::solana",
+                                    "failed to process deposit {}: {}",
+                                    sig_str,
+                                    e
+                                );
+                                sig_success = false;
+                                break;
+                            }
+                        }
                     }
-                    if let Some(sig) = parsed {
-                        outcomes.push((sig, true));
-                    }
-                }
-                Err(e) => {
-                    log::error!(
-                        target: "paraloom::bridge::solana",
-                        "failed to process deposit {}: {}",
-                        sig_str,
-                        e
-                    );
-                    if let Some(sig) = parsed {
-                        outcomes.push((sig, false));
+                    BridgeProgramEvent::Transact {
+                        signature,
+                        nullifiers,
+                        output_commitments,
+                        block,
+                    } => {
+                        match state
+                            .pool
+                            .index_transact_settlement(nullifiers, output_commitments)
+                            .await
+                        {
+                            Ok(_) => {
+                                if block > latest_slot {
+                                    latest_slot = block;
+                                }
+                            }
+                            Err(e) => {
+                                log::error!(
+                                    target: "paraloom::bridge::solana",
+                                    "failed to index transact settlement {}: {}",
+                                    signature,
+                                    e
+                                );
+                                sig_success = false;
+                                break;
+                            }
+                        }
                     }
                 }
             }
+
+            outcomes.push((sig, sig_success));
         }
 
         let (cursor_advance, failed) = Self::contiguous_cursor(&outcomes);
@@ -384,9 +426,9 @@ impl EventListener {
             }
         }
         if latest_slot > 0 {
-            // `last_block` tracks the most recent DEPOSIT slot for stats; the
+            // `last_block` tracks the most recent event slot for stats; the
             // scan frontier (`last_processed_slot`) is advanced by
-            // `update_lag_metric` to the chain tip, not to the deposit slot.
+            // `update_lag_metric` to the chain tip, not to the event slot.
             state.stats.write().await.last_block = latest_slot;
         }
 
@@ -447,31 +489,12 @@ impl EventListener {
         *state.last_processed_slot.write().await = current_slot;
     }
 
-    /// Fetch deposit events newer than `cursor` from the Solana RPC.
-    ///
-    /// Uses `getSignaturesForAddress` to walk the recent transaction
-    /// history of the bridge program, pulls each transaction in full,
-    /// and lets [`extract_deposit_events`] turn them into typed events.
-    /// Signatures already seen during this listener's lifetime are
-    /// filtered out before the RPC fetch to avoid redundant
-    /// `getTransaction` calls.
-    async fn fetch_events(
+    /// Poll signatures from Solana and fetch/decode bridge events (deposits and transacts).
+    /// Returns the chronological list of scanned program signatures alongside their decoded events (#920).
+    async fn fetch_scanned_batch(
         state: &PollerState,
         cursor: Option<Signature>,
-    ) -> Result<Vec<DepositEvent>> {
-        // RPC calls go through the BridgeRpc trait — RealBridgeRpc
-        // handles the spawn_blocking + ClientError mapping, mocks
-        // return canned data directly.
-        //
-        // `getSignaturesForAddress` returns newest-first, capped at
-        // `SIGNATURE_BATCH_LIMIT`. When more than one batch of program
-        // transactions accumulated since `cursor` (a burst, or a resume after
-        // downtime), a single call would return only the newest batch and drop
-        // every deposit older than it. Walk older pages with `before` until a
-        // short page reaches `cursor` (or history runs out), so the gap is never
-        // dropped. On a cold start (`cursor == None`) there is no resume point,
-        // so take only the newest page and begin scanning from now rather than
-        // replaying the program's entire history.
+    ) -> Result<Vec<(Signature, Vec<BridgeProgramEvent>)>> {
         let mut signatures = Vec::new();
         let mut before: Option<Signature> = None;
         let mut pages = 0usize;
@@ -563,8 +586,13 @@ impl EventListener {
         }
 
         // The RPC returns newest-first; we want to process in the order
-        // the chain produced them so the cursor advances monotonically.
-        let mut to_fetch = Vec::with_capacity(signatures.len());
+        // the chain produced them so the cursor advances monotonically (#920).
+        enum ItemToProcess {
+            Empty(Signature),
+            NeedFetch(Signature),
+        }
+
+        let mut items = Vec::with_capacity(signatures.len());
         {
             let seen = state.seen_signatures.read().await;
             for s in signatures.into_iter().rev() {
@@ -581,47 +609,49 @@ impl EventListener {
                     }
                 };
                 if s.err.is_some() {
+                    items.push(ItemToProcess::Empty(sig));
                     continue;
                 }
                 if seen.contains(&sig) {
+                    items.push(ItemToProcess::Empty(sig));
                     continue;
                 }
-                to_fetch.push(sig);
+                items.push(ItemToProcess::NeedFetch(sig));
             }
         }
 
-        let mut events = Vec::new();
-        let mut newly_seen = Vec::with_capacity(to_fetch.len());
-        for sig in to_fetch {
-            let confirmed = match state.rpc.get_transaction(&sig, LISTENER_TX_ENCODING).await {
-                Ok(tx) => tx,
-                Err(e) => {
-                    // Do NOT skip. A `getTransaction` failure happens before we
-                    // can decode whether this finalized program signature was a
-                    // deposit, so it produces no outcome — and the
-                    // contiguous-cursor barrier only freezes on decoded
-                    // outcomes. If we skipped it and a newer deposit in the same
-                    // batch succeeded, the cursor would advance past this
-                    // un-fetched signature: the next poll's `until` boundary
-                    // would exclude it and a restart would resume past it,
-                    // durably losing a real deposit (#429). Propagate the error
-                    // so the cursor stays put; the next poll re-fetches this
-                    // signature (it was never marked seen), and re-processing is
-                    // idempotent at the pool.
-                    log::warn!(
-                        target: "paraloom::bridge::solana",
-                        "failed to fetch tx {}: {} — aborting this poll so the cursor cannot advance past it",
-                        sig,
-                        e
-                    );
-                    return Err(e);
-                }
-            };
+        let mut scanned_batch = Vec::with_capacity(items.len());
+        let mut newly_seen = Vec::new();
 
-            let sig_str = sig.to_string();
-            let mut decoded = extract_deposit_events(&sig_str, &confirmed, &state.program_id);
-            events.append(&mut decoded);
-            newly_seen.push(sig);
+        for item in items {
+            match item {
+                ItemToProcess::Empty(sig) => {
+                    scanned_batch.push((sig, Vec::new()));
+                }
+                ItemToProcess::NeedFetch(sig) => {
+                    let confirmed = match state
+                        .rpc
+                        .get_transaction(&sig, LISTENER_TX_ENCODING)
+                        .await
+                    {
+                        Ok(tx) => tx,
+                        Err(e) => {
+                            log::warn!(
+                                target: "paraloom::bridge::solana",
+                                "failed to fetch tx {}: {} — aborting this poll so the cursor cannot advance past it",
+                                sig,
+                                e
+                            );
+                            return Err(e);
+                        }
+                    };
+
+                    let sig_str = sig.to_string();
+                    let decoded = extract_bridge_events(&sig_str, &confirmed, &state.program_id);
+                    scanned_batch.push((sig, decoded));
+                    newly_seen.push(sig);
+                }
+            }
         }
 
         // Mark signatures seen only after the WHOLE batch was fetched
@@ -640,6 +670,23 @@ impl EventListener {
             }
         }
 
+        Ok(scanned_batch)
+    }
+
+    /// Poll signatures from Solana and fetch/decode deposits.
+    async fn fetch_events(
+        state: &PollerState,
+        cursor: Option<Signature>,
+    ) -> Result<Vec<DepositEvent>> {
+        let batch = Self::fetch_scanned_batch(state, cursor).await?;
+        let mut events = Vec::new();
+        for (_sig, sig_events) in batch {
+            for event in sig_events {
+                if let BridgeProgramEvent::Deposit(d) = event {
+                    events.push(d);
+                }
+            }
+        }
         Ok(events)
     }
 
@@ -1545,5 +1592,118 @@ mod tests {
             0
         );
         assert_eq!(pool.commitment_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn poll_events_advances_cursor_across_non_deposit_and_reverted_transactions() {
+        use crate::bridge::solana::test_support::{synth_empty_program_tx, MockBridgeRpc};
+        use solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature;
+        use solana_sdk::transaction::TransactionError;
+
+        let program_id = Pubkey::new_unique();
+        let sig1 = Signature::new_unique();
+        let sig2 = Signature::new_unique();
+        let sig3 = Signature::new_unique();
+
+        let mock = Arc::new(MockBridgeRpc::new());
+        *mock.next_get_signatures.lock().unwrap() = Some(Ok(vec![
+            RpcConfirmedTransactionStatusWithSignature {
+                signature: sig3.to_string(),
+                slot: 30,
+                err: None,
+                memo: None,
+                block_time: None,
+                confirmation_status: None,
+            },
+            RpcConfirmedTransactionStatusWithSignature {
+                signature: sig2.to_string(),
+                slot: 20,
+                err: Some(TransactionError::AlreadyProcessed),
+                memo: None,
+                block_time: None,
+                confirmation_status: None,
+            },
+            RpcConfirmedTransactionStatusWithSignature {
+                signature: sig1.to_string(),
+                slot: 10,
+                err: None,
+                memo: None,
+                block_time: None,
+                confirmation_status: None,
+            },
+        ]));
+
+        mock.get_transactions
+            .lock()
+            .unwrap()
+            .insert(sig1, synth_empty_program_tx(sig1, 10, &program_id));
+        mock.get_transactions
+            .lock()
+            .unwrap()
+            .insert(sig3, synth_empty_program_tx(sig3, 30, &program_id));
+
+        let mut state = make_state(mock);
+        state.program_id = program_id;
+
+        assert_eq!(*state.last_signature.read().await, None);
+
+        let processed = EventListener::poll_events(&state).await.unwrap();
+        assert_eq!(processed, 0);
+
+        // Cursor must advance to the newest signature (sig3) even though all transactions
+        // were non-deposits or reverted! (#920)
+        assert_eq!(*state.last_signature.read().await, Some(sig3));
+    }
+
+    #[tokio::test]
+    async fn poll_events_indexes_transact_settlement_into_shielded_pool() {
+        use crate::bridge::solana::test_support::{synth_transact_tx, MockBridgeRpc};
+        use crate::privacy::types::Nullifier;
+        use solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature;
+
+        let program_id = Pubkey::new_unique();
+        let transact_sig = Signature::new_unique();
+        let nullifiers = [[77u8; 32], [88u8; 32]];
+        let output_commitments = [[33u8; 32], [44u8; 32]];
+
+        let mock = Arc::new(MockBridgeRpc::new());
+        *mock.next_get_signatures.lock().unwrap() =
+            Some(Ok(vec![RpcConfirmedTransactionStatusWithSignature {
+                signature: transact_sig.to_string(),
+                slot: 50,
+                err: None,
+                memo: None,
+                block_time: None,
+                confirmation_status: None,
+            }]));
+
+        mock.get_transactions.lock().unwrap().insert(
+            transact_sig,
+            synth_transact_tx(
+                transact_sig,
+                50,
+                &program_id,
+                nullifiers,
+                output_commitments,
+            ),
+        );
+
+        let mut state = make_state(mock);
+        state.program_id = program_id;
+
+        assert_eq!(state.pool.commitment_count().await, 0);
+        assert!(!state.pool.is_spent(&Nullifier(nullifiers[0])).await);
+        assert!(!state.pool.is_spent(&Nullifier(nullifiers[1])).await);
+
+        let processed = EventListener::poll_events(&state).await.unwrap();
+        assert_eq!(processed, 0);
+
+        // Commitments and nullifiers must be indexed into the pool (#920)
+        assert_eq!(state.pool.commitment_count().await, 2);
+        assert!(state.pool.is_spent(&Nullifier(nullifiers[0])).await);
+        assert!(state.pool.is_spent(&Nullifier(nullifiers[1])).await);
+
+        // Cursor must advance to the transact signature
+        assert_eq!(*state.last_signature.read().await, Some(transact_sig));
     }
 }

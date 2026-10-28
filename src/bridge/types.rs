@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 pub type SolanaAddress = [u8; 32];
 
 /// Deposit event from Solana
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DepositEvent {
     /// Transaction signature on Solana
     pub signature: String,

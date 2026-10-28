@@ -224,6 +224,37 @@ impl ShieldedPool {
         }
     }
 
+    /// Index settled transact / transact_spl output commitments and spent nullifiers
+    /// into the shielded pool (#920).
+    ///
+    /// Appends non-zero output commitments to the Merkle tree (deduplicated via `deposited`)
+    /// and marks non-zero input nullifiers as spent in `nullifier_set`.
+    /// Idempotent: replaying the same settlement will not re-insert commitments or duplicate leaves.
+    pub async fn index_transact_settlement(
+        &self,
+        nullifiers: [[u8; 32]; 2],
+        output_commitments: [[u8; 32]; 2],
+    ) -> Result<()> {
+        for n in nullifiers {
+            if n != [0u8; 32] {
+                self.nullifier_set.insert(Nullifier(n)).await?;
+            }
+        }
+
+        let mut deposited = self.deposited.write().await;
+        for c_bytes in output_commitments {
+            if c_bytes != [0u8; 32] {
+                let commitment = Commitment(c_bytes);
+                if !deposited.contains(&commitment) {
+                    self.commitment_tree.insert(&commitment).await?;
+                    deposited.insert(commitment);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Get the native-SOL shielded supply.
     ///
     /// Back-compat accessor preserved from the single-asset pool; equivalent
@@ -487,5 +518,41 @@ mod tests {
 
         assert!(pool.is_spent(&Nullifier(n0)).await);
         assert!(pool.is_spent(&Nullifier(n1)).await);
+    }
+
+    #[tokio::test]
+    async fn test_index_transact_settlement_updates_commitments_and_nullifiers() {
+        let pool = ShieldedPool::new();
+        let n0 = [10u8; 32];
+        let n1 = [11u8; 32];
+        let c0 = [20u8; 32];
+        let c1 = [21u8; 32];
+
+        assert_eq!(pool.commitment_count().await, 0);
+        assert!(!pool.is_spent(&Nullifier(n0)).await);
+        assert!(!pool.is_spent(&Nullifier(n1)).await);
+
+        pool.index_transact_settlement([n0, n1], [c0, c1])
+            .await
+            .expect("indexing transact settlement must succeed");
+
+        assert_eq!(pool.commitment_count().await, 2);
+        assert!(pool.is_spent(&Nullifier(n0)).await);
+        assert!(pool.is_spent(&Nullifier(n1)).await);
+
+        // Idempotency: re-indexing the same settlement must not duplicate commitments
+        pool.index_transact_settlement([n0, n1], [c0, c1])
+            .await
+            .expect("re-indexing must be idempotent");
+        assert_eq!(pool.commitment_count().await, 2);
+
+        // Zero output commitments must be skipped
+        let c_zero = [0u8; 32];
+        let n_new = [12u8; 32];
+        pool.index_transact_settlement([n_new, [0u8; 32]], [c_zero, c_zero])
+            .await
+            .expect("indexing zero commitments must succeed without inserting leaves");
+        assert_eq!(pool.commitment_count().await, 2);
+        assert!(pool.is_spent(&Nullifier(n_new)).await);
     }
 }

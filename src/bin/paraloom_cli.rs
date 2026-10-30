@@ -2297,3 +2297,64 @@ file = ".paraloom/logs/paraloom.log"
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn test_cli_parse_validator_unregister() {
+        let args = [
+            "paraloom",
+            "validator",
+            "unregister",
+            "--program-id",
+            "11111111111111111111111111111111",
+        ];
+        let cli = Cli::try_parse_from(args).expect("should parse validator unregister");
+        match cli.command {
+            Commands::Validator { command } => match command {
+                ValidatorCommands::Unregister { program_id, .. } => {
+                    assert_eq!(
+                        program_id.as_deref(),
+                        Some("11111111111111111111111111111111")
+                    );
+                }
+                _ => panic!("expected Unregister"),
+            },
+            _ => panic!("expected Validator"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_validator_deactivate() {
+        let args = [
+            "paraloom",
+            "validator",
+            "deactivate",
+            "--validator",
+            "11111111111111111111111111111111",
+            "--program-id",
+            "22222222222222222222222222222222",
+        ];
+        let cli = Cli::try_parse_from(args).expect("should parse validator deactivate");
+        match cli.command {
+            Commands::Validator { command } => match command {
+                ValidatorCommands::Deactivate {
+                    validator,
+                    program_id,
+                    ..
+                } => {
+                    assert_eq!(validator.to_string(), "11111111111111111111111111111111");
+                    assert_eq!(
+                        program_id.as_deref(),
+                        Some("22222222222222222222222222222222")
+                    );
+                }
+                _ => panic!("expected Deactivate"),
+            },
+            _ => panic!("expected Validator"),
+        }
+    }
+}
